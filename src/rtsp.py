@@ -178,7 +178,7 @@ class VideoAudioDecoder():
         if codec.video and codec.video in VIDEO:
             decode_set = VIDEO[codec.video]["decode_set"]
             desc += make_chain_desc(decode_set)
-            desc += "videoconvert ! "
+            # desc += "videoconvert ! "
             desc += "appsink name=v_appsink emit-signals=true sync=false \n"
             self._vq = EvictingQueue()
             sink.video = decode_set[0]
@@ -186,7 +186,7 @@ class VideoAudioDecoder():
         if codec.audio and codec.audio in AUDIO:
             decode_set = AUDIO[codec.audio]["decode_set"]
             desc += make_chain_desc(decode_set)
-            desc += "audioconvert ! "
+            # desc += "audioconvert ! "
             desc += "audioresample ! "
             desc += "appsink name=a_appsink emit-signals=true sync=false \n"
             self._aq = EvictingQueue()
@@ -276,14 +276,19 @@ class VideoAudioEncoder():
             encode_set = AUDIO[codec.audio]["encode_set"]
             desc += "appsrc name=asrc is-live=true block=true format=time ! "
             desc += "queue ! "
-            desc += "audioconvert ! "
+            desc += "audioconvert ! queue !"
             desc += make_chain_desc(encode_set)  # mulawenc / alawenc
             desc += "mux. \n"
 
-        desc += "matroskamux name=mux ! "
-        # <-- TODO: FAKE SINK
-        desc += "fakesink \n"
+        # <-- TODO: MUX
+        # desc += "matroskamux name=mux ! "
+        desc += "flvmux name=mux streamable=true latency=1000 ! queue ! "
+        # -->
+
+        # <-- TODO: SINK
+        # desc += "fakesink \n"
         # desc += f"filesink location={datetime.now().strftime('%Y%m%d_%H%M%S')}.mkv \n"
+        desc += "rtmpsink location=rtmp://172.27.1.123:1935/live/mystream \n"
         # -->
 
         self._pipe = Gst.parse_launch(desc)
