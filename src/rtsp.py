@@ -1,7 +1,7 @@
 import json
 import time
 import threading
-from datetime import datetime
+# from datetime import datetime
 from typing import Any
 from dataclasses import dataclass, fields
 
@@ -14,6 +14,7 @@ from gi.repository import Gst, GLib
 
 from src.task import SingleThreadTask
 from src.buffer import EvictingQueue
+from src.ip import get_local_ip
 
 
 Gst.init(None)
@@ -307,7 +308,8 @@ class VideoAudioEncoder():
         # <-- TODO: SINK
         # desc += "fakesink \n"
         # desc += f"filesink location={datetime.now().strftime('%Y%m%d_%H%M%S')}.mkv \n"
-        desc += "rtmpsink location=rtmp://172.27.1.123:1935/live/mystream \n"
+        desc += f"rtmpsink location=rtmp://{get_local_ip()}:1935/live/stream1 \n"
+        logger.debug(f"rtmp://{get_local_ip()}:1935/live/stream1")
         # -->
 
         self._pipe = Gst.parse_launch(desc)
