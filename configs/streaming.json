@@ -1,0 +1,11 @@
+{
+    "location": "",
+    "infer_size": [
+        1280,
+        720
+    ],
+    "conf_thres": 0.25,
+    "scale_factor": 0.5,
+    "pixel_size": 25,
+    "roi": []
+}

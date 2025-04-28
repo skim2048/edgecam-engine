@@ -25,6 +25,16 @@ VIDEO = _CHAIN["video"]
 AUDIO = _CHAIN["audio"]
 
 
+class FailedToExtract(Exception):
+
+    def __init__(self, msg: str=""):
+        super().__init__(msg)
+        self.msg = msg
+
+    def __str__(self):
+        return self.msg
+
+
 @dataclass
 class Pair():
 
@@ -94,6 +104,15 @@ def extract_codec(location: str, timeout: int=10) -> Pair:
     src.disconnect(handler_id)
     pipe.set_state(Gst.State.NULL)
     logger.info(f'Extracting complete: (video: {codec.video}, audio: {codec.audio})')
+
+    if codec.video is None and codec.audio is None:
+        err = (
+            "Failed to extract codec. Please check for possible issues "
+            "such as a typo in the location source, unsupported codec, "
+            "or network latency."
+        )
+        raise FailedToExtract(err)
+
     return codec
 
 

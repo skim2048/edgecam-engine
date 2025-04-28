@@ -39,7 +39,7 @@ class Facedetector(YOLOWrapper):
         download_model()
         super().__init__(model_pt=MODEL_FILE)
 
-    def predict(self, image: np.ndarray, tracking: bool=False) -> np.ndarray:
+    def predict(self, image: np.ndarray, conf: float=0.25, tracking: bool=False) -> np.ndarray:
         """ NOTE: skim2048
         If tracking is true:
           return shape is [n, 7]
@@ -48,6 +48,6 @@ class Facedetector(YOLOWrapper):
           return shape is [n, 6]
           : x1, y1, x2, y2, confidence, and label.
         """
-        results = super().predict(image, tracking)
+        results = super().predict(image, conf=conf, tracking=tracking)
         boxes = results[0].boxes.data.cpu().numpy()
         return boxes

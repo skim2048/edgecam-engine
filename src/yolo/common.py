@@ -11,11 +11,11 @@ class YOLOWrapper:
     def __init__(self, model_pt: str):
         self._model = YOLO(model_pt)
 
-    def predict(self, image: np.ndarray, tracking: bool=False) -> Results:
+    def predict(self, image: np.ndarray, conf: float=0.25, tracking: bool=False) -> Results:
         if tracking:
-            results = self._model.track(image, persist=True, verbose=False)
+            results = self._model.track(image, conf=conf, persist=True, verbose=False)
         else:
-            results = self._model.predict(image, verbose=False)
+            results = self._model.predict(image, conf=conf, verbose=False)
         return results
 
     def release(self):
