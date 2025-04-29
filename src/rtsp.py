@@ -14,7 +14,6 @@ from gi.repository import Gst, GLib
 
 from src.task import SingleThreadTask
 from src.buffer import EvictingQueue
-from src.ip import get_local_ip
 
 
 Gst.init(None)
@@ -308,8 +307,7 @@ class VideoAudioEncoder():
         # <-- TODO: SINK
         # desc += "fakesink \n"
         # desc += f"filesink location={datetime.now().strftime('%Y%m%d_%H%M%S')}.mkv \n"
-        desc += f"rtmpsink location=rtmp://{get_local_ip()}:1935/live/stream1 \n"
-        logger.debug(f"rtmp://{get_local_ip()}:1935/live/stream1")
+        desc += f"rtmpsink location=rtmp://localhost:1935/stream1 \n"
         # -->
 
         self._pipe = Gst.parse_launch(desc)

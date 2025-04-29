@@ -11,7 +11,7 @@
                     "x264enc speed-preset=ultrafast bitrate=4000 key-int-max=30"
                 ]
             },
-            "[DO-NOT-USE] H265": {
+            "[DO-NOT-USE]H265": {
                 "decode_set": [
                     "rtph265depay",
                     "h265parse",
@@ -41,7 +41,7 @@
                     "alawenc"
                 ]
             },
-            "[DO-NOT-USE] MPEG4-GENERIC": {
+            "[DO-NOT-USE]MPEG4-GENERIC": {
                 "decode_set": [
                     "rtpmp4adepay",
                     "aacparse",

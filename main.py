@@ -111,13 +111,7 @@ def store_configuration():
 async def lifespan(app: FastAPI):
     global FACEDET
     FACEDET = Facedetector()
-    try:
-        start_streamer(LOCATION)
-    except:
-        logger.warning("The location stored in streaming.json appears to be invalid. Please reconfigure it from the console.")
-        stop_streamer()
     yield
-
     stop_streamer()
     FACEDET.release()
 
@@ -141,14 +135,14 @@ async def start_streaming(data: dict=Body(...)):
         loc = LOCATION if not location else location
         start_streamer(loc)
     except FailedToExtract as e:
-        logger.exception()
+        logger.exception(e)
         stop_streamer()
         raise HTTPException(
             status_code=400,
             detail=f"FastAPI - {str(e)}"
         )
     except Exception as e:
-        logger.exception()
+        logger.exception(e)
         stop_streamer()
         raise HTTPException(
             status_code=500,
@@ -156,6 +150,7 @@ async def start_streaming(data: dict=Body(...)):
         )
     else:
         LOCATION = loc
+        store_configuration()
     return {"status": "success", "message": "streaming started." }
 
 
