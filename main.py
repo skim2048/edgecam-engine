@@ -256,6 +256,7 @@ async def websocket_endpoint(ws: WebSocket):
         logger.info('Connection has cancelled.')
     except Exception as e:
         logger.exception(f'Unexpected error: {str(e)}')
+        await ws.close(code=1011)
     finally:
         if not ws.client_state.name == "DISCONNECTED":
             await ws.close()
