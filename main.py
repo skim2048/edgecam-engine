@@ -1,5 +1,7 @@
 import json
+import time
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 
 import cv2
@@ -20,6 +22,9 @@ STREAMER: RTSPStreamer | None = None
 
 IS_ROI_UPDATED: bool = False
 ROI_MASK: np.ndarray | None = None
+
+IS_RESTARTING = False
+RESTART_LOCK = threading.Lock()
 
 
 with open("configs/streaming.json", "r") as f:
@@ -76,6 +81,40 @@ def deidentify_face(frame: np.ndarray):
     return frame
 
 
+def start_streamer(location: str):
+    global STREAMER, IS_RESTARTING
+
+    if STREAMER:
+        STREAMER.stop_streaming()
+
+    def _on_error(e: Exception):
+        global IS_RESTARTING
+
+        with RESTART_LOCK:
+            if IS_RESTARTING:
+                return
+            IS_RESTARTING = True
+
+        def _restart():
+            global IS_RESTARTING
+            logger.warning("Stream lost. Reconnecting in 5 seconds…")
+            while True:
+                time.sleep(5)
+                try:
+                    start_streamer(location)
+                    break
+                except Exception as err:
+                    logger.exception(f"Reconnection failed: {err}. Retrying in 5 seconds…")
+
+            with RESTART_LOCK:
+                IS_RESTARTING = False
+
+        threading.Thread(target=_restart, daemon=True).start()
+
+    STREAMER = RTSPStreamer(deidentify_face, on_error=_on_error)
+    STREAMER.start_streaming(location)
+
+
 def stop_streamer():
     global STREAMER
     if STREAMER is not None:
@@ -85,13 +124,6 @@ def stop_streamer():
             logger.warning("Unexpected error occurred while stopping stream.")
         finally:
             STREAMER = None
-
-
-def start_streamer(location: str):
-    global STREAMER
-    stop_streamer()
-    STREAMER = RTSPStreamer(deidentify_face)
-    STREAMER.start_streaming(location)
 
 
 def store_configuration():
@@ -111,6 +143,8 @@ def store_configuration():
 async def lifespan(app: FastAPI):
     global FACEDET
     FACEDET = Facedetector()
+    if LOCATION is not None:
+        start_streamer(LOCATION)
     yield
     stop_streamer()
     FACEDET.release()
@@ -151,7 +185,7 @@ async def start_streaming(data: dict=Body(...)):
     else:
         LOCATION = loc
         store_configuration()
-    return {"status": "success", "message": "streaming started." }
+    return { "status": "success", "message": "streaming started." }
 
 
 @app.post("/streaming/stop")

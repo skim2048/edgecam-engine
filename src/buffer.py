@@ -33,7 +33,7 @@ class EvictingQueue:
             self._put(item)
             self.not_empty.notify()
 
-    def get(self, timeout_sec: float=30.0) -> Any:
+    def get(self, timeout_sec: float=5.0) -> Any:
         with self.not_empty:
             endtime = time.monotonic() + timeout_sec
             while not self._deque:
@@ -66,7 +66,7 @@ class AsyncEvictingQueue:
             await self._put(item)
             self.not_empty.notify()
 
-    async def get(self, timeout_sec: float=30.0) -> Any:
+    async def get(self, timeout_sec: float=5.0) -> Any:
         async with self.not_empty:
             try:
                 await asyncio.wait_for(self.not_empty.wait(), timeout_sec)

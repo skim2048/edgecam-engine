@@ -13,7 +13,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
 
 from src.task import SingleThreadTask
-from src.buffer import EvictingQueue
+from src.buffer import EvictingQueue, Timeout
 
 
 Gst.init(None)
@@ -349,7 +349,7 @@ class VideoAudioEncoder():
 
 class RTSPStreamer():
 
-    def __init__(self, callback: None):
+    def __init__(self, fn_improc, on_error=None):
         self._loop: GLib.MainLoop | None = None
         self._loop_th: threading.Thread | None = None
 
@@ -366,14 +366,20 @@ class RTSPStreamer():
         self._audio_feeder: SingleThreadTask | None = None
 
         self._ws_queue: EvictingQueue | None = None
-        self._callback = callback
+        self._fn_improc = fn_improc
+        self._on_error = on_error
 
     @property
     def websocket_queue(self) -> EvictingQueue | None:
         return self._ws_queue
 
     def _process_frames(self):
-        blob = self._decoder.video_queue.get()
+        try:
+            blob = self._decoder.video_queue.get()
+        except Timeout as e:
+            if self._on_error:
+                self._on_error(e)
+            return
         frame_yuv, pts, dts, duration = blob
         frame_bgr = cv2.cvtColor(frame_yuv, cv2.COLOR_YUV2BGR_I420)
         if not self._caps_str.video:
@@ -382,7 +388,7 @@ class RTSPStreamer():
             self._caps_ready.set()
         # <-- TODO: DE-IDENTIFICATION
         try:
-            res = self._callback(frame_bgr)
+            res = self._fn_improc(frame_bgr)
         except:
             logger.exception("INFERENCE EEROR:")
             res = draw_circle(frame_bgr)
@@ -399,7 +405,12 @@ class RTSPStreamer():
         self._frame_queue.put(blob)
 
     def _feed_video(self, appsrc):
-        blob = self._frame_queue.get()
+        try:
+            blob = self._frame_queue.get()
+        except Timeout as e:
+            if self._on_error:
+                self._on_error(e)
+            return
         frame_bytes, pts, dts, duration = blob
         buf = Gst.Buffer.new_allocate(None, len(frame_bytes), None)
         buf.fill(0, frame_bytes)
@@ -409,7 +420,12 @@ class RTSPStreamer():
         appsrc.emit("push-buffer", buf)
 
     def _feed_audio(self, appsrc):
-        blob = self._decoder.audio_queue.get()
+        try:
+            blob = self._decoder.audio_queue.get()
+        except Timeout as e:
+            if self._on_error:
+                self._on_error(e)
+            return
         audio_bytes, pts, dts, duration = blob
         buf = Gst.Buffer.new_allocate(None, len(audio_bytes), None)
         buf.fill(0, audio_bytes)
