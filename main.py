@@ -35,7 +35,7 @@ INFER_SIZE = CFG["infer_size"]
 CONF_THRES = CFG["conf_thres"]
 SCALE_FACTOR = CFG["scale_factor"]
 PIXEL_SIZE = CFG["pixel_size"]
-ROI: np.ndarray = CFG["roi"] if CFG["roi"] else np.zeros(shape=(0, 2))
+ROI = CFG["roi"]
 
 
 def exclude_xyxy(xyxy: np.ndarray) -> np.ndarray:
@@ -50,9 +50,10 @@ def exclude_xyxy(xyxy: np.ndarray) -> np.ndarray:
 
 def update_mask(frame_shape: tuple[int, int]):
     global ROI_MASK
-    if not ROI is None and ROI.shape[0] >= 3:
+    roi = np.array(ROI)
+    if roi.shape[0] >= 3:
         frame_w, frame_h = frame_shape
-        roi_pts = (ROI * (frame_w, frame_h)).astype(int)
+        roi_pts = (roi * (frame_w, frame_h)).astype(int)
         mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
         ROI_MASK = cv2.fillPoly(mask, [roi_pts.reshape(-1, 1, 2)], 255)
     else:
@@ -133,7 +134,7 @@ def store_configuration():
         "conf_thres": CONF_THRES,
         "scale_factor" : SCALE_FACTOR,
         "pixel_size": PIXEL_SIZE,
-        "roi": ROI.tolist()
+        "roi": ROI
     }
     with open("configs/streaming.json", "w") as f:
         json.dump(new_cfg, f, indent=4)
@@ -143,7 +144,7 @@ def store_configuration():
 async def lifespan(app: FastAPI):
     global FACEDET
     FACEDET = Facedetector()
-    if LOCATION is not None:
+    if LOCATION:
         start_streamer(LOCATION)
     yield
     stop_streamer()
@@ -209,19 +210,13 @@ async def store_configs():
 
 @app.get("/get/roi")
 async def get_roi():
-    global ROI
-    if type(ROI) == type([]):
-        ROI = np.array(ROI)
-    return {"status": "success", "rois": ROI.tolist()}
+    return {"status": "success", "rois": ROI}
 
 
 @app.post("/update/roi")
 async def update_roi(roi_data: dict=Body(...)):
     global ROI, IS_ROI_UPDATED
-    roi = np.array(roi_data.get("rois", []))
-    if roi.ndim != 2:
-        roi = np.zeros(shape=(0, 2))
-    ROI = roi
+    ROI = roi_data.get("rois", [])
     IS_ROI_UPDATED = True
     return {"status": "success", "message": "roi updated." }
 
