@@ -1,18 +1,19 @@
-from dataclasses import dataclass, fields
 import json
-import threading
 import time
-from typing import Callable, Any
+import threading
+# from datetime import datetime
+from typing import Any
+from dataclasses import dataclass, fields
 
 import cv2
+import numpy as np
+from loguru import logger
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
-from loguru import logger
-import numpy as np
 
-from src.buffer import EvictingQueue
 from src.task import SingleThreadTask
+from src.buffer import EvictingQueue, Timeout
 
 
 Gst.init(None)
@@ -20,14 +21,25 @@ Gst.init(None)
 
 with open("configs/chain.json", "r") as f:
     CHAIN = json.load(f)
-AUDIO = CHAIN["audio"]
 VIDEO = CHAIN["video"]
+AUDIO = CHAIN["audio"]
+
+
+class FailedToExtract(Exception):
+
+    def __init__(self, msg: str=""):
+        super().__init__(msg)
+        self.msg = msg
+
+    def __str__(self):
+        return self.msg
 
 
 @dataclass
-class AVPair:
-    audio: Any
+class Pair():
+
     video: Any
+    audio: Any
 
     @property
     def media_type(self) -> list[str]:
@@ -35,25 +47,10 @@ class AVPair:
     
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
-
+    
     def __setitem__(self, key: str, value: Any):
         return setattr(self, key, value)
 
-
-def get_chain(elements: list[str]) -> str:
-    chain = ""
-    for i, ele in enumerate(elements):
-        name = f"name={ele}" if not i else ""
-        chain += f"{ele} {name} ! "
-    return chain
-
-
-def valid_codec(codec: AVPair):
-    if not codec.video or not codec.video in VIDEO:
-        raise ValueError(f"Invalid or unsupported video codec: {codec.video}")
-    if codec.audio and not codec.audio in AUDIO:
-        raise ValueError(f"Unsupported audio codec: {codec.audio}")
-    
 
 def draw_circle(img: np.ndarray):
     img = img.copy()
@@ -65,9 +62,8 @@ def draw_circle(img: np.ndarray):
     return img
 
 
-def extract_codec(location: str, timeout_sec: int=5) -> AVPair:
-    # e.g. location = rtsp://admin:****@192.***.***.***:554/stream
-    codec = AVPair(None, None)
+def extract_codec(location: str, timeout: int=10) -> Pair:
+    codec = Pair(None, None)
     lock = threading.Lock()
     cond = threading.Condition(lock)
     loop = GLib.MainLoop()
@@ -86,18 +82,18 @@ def extract_codec(location: str, timeout_sec: int=5) -> AVPair:
             start_t = time.time()
             while codec.video is None or codec.audio is None:
                 elapsed = time.time() - start_t
-                remaining = timeout_sec - elapsed
+                remaining = timeout - elapsed
                 if remaining <= 0:
                     logger.warning("Timeout occurred during codec extraction.")
                     break
-                cond.wait(timeout_sec=remaining)
+                cond.wait(timeout=remaining)
         loop.quit()
 
     pipe = Gst.parse_launch(f"rtspsrc name=src location={location} latency=200 ! fakesink")
     src = pipe.get_by_name('src')
     handler_id = src.connect('pad-added', on_pad_added)
 
-    logger.info(f'Attempting to extract codecs within {timeout_sec}s ...')
+    logger.info(f'Attempting to extract codecs within {timeout} seconds ...')
     pipe.set_state(Gst.State.PLAYING)
 
     wait_th = threading.Thread(target=wait_for_codec_extraction)
@@ -108,23 +104,42 @@ def extract_codec(location: str, timeout_sec: int=5) -> AVPair:
     src.disconnect(handler_id)
     pipe.set_state(Gst.State.NULL)
     logger.info(f'Extracting complete: (video: {codec.video}, audio: {codec.audio})')
+
+    if codec.video is None and codec.audio is None:
+        err = (
+            "Failed to extract codec. Please check for possible issues "
+            "such as a typo in the location source, unsupported codec, "
+            "or network latency."
+        )
+        raise FailedToExtract(err)
+
     return codec
 
 
-class AVDecoder:
+def make_chain_desc(elements: list[str]) -> str:
+    desc = ""
+    for i, ele in enumerate(elements):
+        name = f"name={ele}" if not i else ""
+        desc += f"{ele} {name} ! "
+    return desc
+
+
+class VideoAudioDecoder():
+
     def __init__(self):
-        self._pipe: Gst.Pipeline = None
-        self._vqueue: EvictingQueue = None
-        self._aqueue: EvictingQueue = None
+        self._pipe: Gst.Pipeline | None = None
+        self._vq: EvictingQueue | None = None
+        self._aq: EvictingQueue | None = None
+
         self._handlers: list = []
 
     @property
     def video_queue(self) -> EvictingQueue | None:
-        return self._vqueue
+        return self._vq
 
     @property
     def audio_queue(self) -> EvictingQueue | None:
-        return self._aqueue
+        return self._aq
 
     def _handle_bus_message(self, bus, msg):
         if msg.type == Gst.MessageType.ERROR:
@@ -132,10 +147,10 @@ class AVDecoder:
             logger.error(f"GStreamer: {err}: {dbg}")
             self.stop()
         elif msg.type == Gst.MessageType.EOS:
-            logger.info("GStreamer: end of stream.")
+            logger.info("GStreamer: End of stream.")
             self.stop()
 
-    def _handle_pad_added(self, src, new_pad, sink: AVPair):
+    def _handle_pad_added(self, src, new_pad, sink: Pair):
         struct = new_pad.query_caps(None).get_structure(0)
         media = struct.get_string("media")
         if media in sink.media_type:
@@ -153,6 +168,7 @@ class AVDecoder:
             return Gst.FlowReturn.ERROR
         struct = sample.get_caps().get_structure(0)
         caps_name = struct.get_name()
+
         try:
             if caps_name == "video/x-raw":
                 w = struct.get_value("width")
@@ -161,34 +177,38 @@ class AVDecoder:
                 frame = np.frombuffer(map_info.data, dtype=np.uint8)
                 frame = frame.reshape(shape)
                 blob = (frame, buf.pts, buf.dts, buf.duration)
-                self._vqueue.put(blob)
+                self._vq.put(blob)
+
             elif caps_name == "audio/x-raw":
                 audio = map_info.data
                 blob = (audio, buf.pts, buf.dts, buf.duration)
-                self._aqueue.put(blob)
+                self._aq.put(blob)
         except:
             logger.exception("Exception occurred while processing the sample:")
         finally:
             buf.unmap(map_info)
+
         return Gst.FlowReturn.OK
 
-    def _create_pipeline(self, location: str, codec: AVPair):
-        sink = AVPair(None, None)
+    def _create_pipeline(self, location: str, codec: Pair):
+        sink = Pair(None, None)
         desc = f"rtspsrc name=rtspsrc location={location} latency=200 ! \n"
+
         if codec.video and codec.video in VIDEO:
             decode_chain = VIDEO[codec.video]["decode_chain"]
-            desc += get_chain(decode_chain)
+            desc += make_chain_desc(decode_chain)
             # desc += "videoconvert ! "
-            desc += "appsink name=vappsink emit-signals=true sync=false \n"
-            self._vqueue = EvictingQueue()
+            desc += "appsink name=v_appsink emit-signals=true sync=false \n"
+            self._vq = EvictingQueue()
             sink.video = decode_chain[0]
+
         if codec.audio and codec.audio in AUDIO:
             decode_chain = AUDIO[codec.audio]["decode_chain"]
-            desc += get_chain(decode_chain)
+            desc += make_chain_desc(decode_chain)
             # desc += "audioconvert ! "
             desc += "audioresample ! "
-            desc += "appsink name=aappsink emit-signals=true sync=false \n"
-            self._aqueue = EvictingQueue()
+            desc += "appsink name=a_appsink emit-signals=true sync=false \n"
+            self._aq = EvictingQueue()
             sink.audio = decode_chain[0]
 
         self._pipe = Gst.parse_launch(desc)
@@ -199,7 +219,7 @@ class AVDecoder:
         src = self._pipe.get_by_name("rtspsrc")
         handler_id = src.connect("pad-added", self._handle_pad_added, sink)
         self._handlers.append((src, handler_id))
-        for name in ["vappsink", "aappsink"]:
+        for name in ["v_appsink", "a_appsink"]:
             appsink = self._pipe.get_by_name(name)
             if appsink:
                 handler_id = appsink.connect("new-sample", self._handle_new_sample)
@@ -210,9 +230,8 @@ class AVDecoder:
         handler_id = bus.connect("message", self._handle_bus_message)        
         self._handlers.append((bus, handler_id))
 
-    def start(self, location: str, codec: AVPair):
+    def start(self, location: str, codec: Pair):
         self.stop()
-        valid_codec(codec)
         self._create_pipeline(location, codec)
         self._pipe.set_state(Gst.State.PLAYING)
 
@@ -231,24 +250,26 @@ class AVDecoder:
         if self._pipe:
             self._pipe.set_state(Gst.State.NULL)
             self._pipe = None
-        self._vqueue = None
-        self._aqueue = None
+        self._vq = None
+        self._aq = None
 
 
-class AVEncoder():
+class VideoAudioEncoder():
+
     def __init__(self):
-        self._pipe: Gst.Pipeline = None
-        self._vappsrc: Gst.Element = None
-        self._aappsrc: Gst.Element = None
+        self._pipe: Gst.Pipeline | None = None
+        self._vsrc: Gst.Element | None = None
+        self._asrc: Gst.Element | None = None
+
         self._handlers: list = []
 
     @property
     def video_appsrc(self) -> Gst.Element | None:
-        return self._vappsrc
+        return self._vsrc
 
     @property
     def audio_appsrc(self) -> Gst.Element | None:
-        return self._aappsrc
+        return self._asrc
 
     def _handle_bus_message(self, bus, msg):
         if msg.type == Gst.MessageType.ERROR:
@@ -259,53 +280,51 @@ class AVEncoder():
             logger.info("[Gst EOS] End of stream")
             self.stop()
 
-    def _create_pipeline(self, codec: AVPair, caps_str: AVPair):
+    def _create_pipeline(self, codec: Pair, caps_str: Pair):
         desc = ""
+
         if codec.video and codec.video in VIDEO:
             encode_chain = VIDEO[codec.video]["encode_chain"]
             desc += "appsrc name=vsrc is-live=true block=true format=time ! "
             desc += "queue ! "
             desc += "videoconvert ! "
-            desc += get_chain(encode_chain)
+            desc += make_chain_desc(encode_chain)  # x264enc / x265enc
             desc += "mux. \n"
+
         if codec.audio and codec.audio in AUDIO:
             encode_chain = AUDIO[codec.audio]["encode_chain"]
             desc += "appsrc name=asrc is-live=true block=true format=time ! "
             desc += "queue ! "
             desc += "audioconvert ! queue !"
-            desc += get_chain(encode_chain)
+            desc += make_chain_desc(encode_chain)  # mulawenc / alawenc
             desc += "mux. \n"
 
-        # ===== 1. Fakesink =====
-        # desc += "fakesink \n"
-        # =======================
-
-        # ===== 2. Filesink =====
+        # <-- TODO: MUX
         # desc += "matroskamux name=mux ! "
-        # desc += f"filesink location={datetime.now().strftime('%Y%m%d_%H%M%S')}.mkv \n"
-        # =======================
-
-        # ===== 3. RTMPsink =====
         desc += "flvmux name=mux streamable=true latency=1000 ! queue ! "
+        # -->
+
+        # <-- TODO: SINK
+        # desc += "fakesink \n"
+        # desc += f"filesink location={datetime.now().strftime('%Y%m%d_%H%M%S')}.mkv \n"
         desc += f"rtmpsink location=rtmp://localhost:1935/stream1 \n"
-        # =======================
+        # -->
 
         self._pipe = Gst.parse_launch(desc)
-        self._vappsrc = self._pipe.get_by_name("vsrc")
-        if self._vappsrc:
-            self._vappsrc.set_property("caps", Gst.Caps.from_string(caps_str.video))
-        self._aappsrc = self._pipe.get_by_name("asrc")
-        if self._aappsrc:
-            self._aappsrc.set_property("caps", Gst.Caps.from_string(caps_str.audio))
+        self._vsrc = self._pipe.get_by_name("vsrc")
+        if self._vsrc:
+            self._vsrc.set_property("caps", Gst.Caps.from_string(caps_str.video))
+        self._asrc = self._pipe.get_by_name("asrc")
+        if self._asrc:
+            self._asrc.set_property("caps", Gst.Caps.from_string(caps_str.audio))
 
         bus = self._pipe.get_bus()
         bus.add_signal_watch()
         handler_id = bus.connect("message", self._handle_bus_message)
         self._handlers.append((bus, handler_id))
 
-    def start(self, codec: AVPair, caps_str: AVPair):
+    def start(self, codec: Pair, caps_str: Pair):
         self.stop()
-        valid_codec(codec)
         self._create_pipeline(codec, caps_str)
         self._pipe.set_state(Gst.State.PLAYING)
 
@@ -324,70 +343,42 @@ class AVEncoder():
         if self._pipe:
             self._pipe.set_state(Gst.State.NULL)
             self._pipe = None
-        self._vappsrc = None
-        self._aappsrc = None
+        self._vsrc = None
+        self._asrc = None
 
 
 class RTSPStreamer():
 
-    def __init__(self, image_processor: Callable, error_handler: Callable):
+    def __init__(self, fn_improc, on_error=None):
         self._loop: GLib.MainLoop | None = None
         self._loop_th: threading.Thread | None = None
 
-        self._decoder: AVDecoder = None
-        self._encoder: AVEncoder = None
+        self._decoder: VideoAudioDecoder | None = None
+        self._encoder: VideoAudioEncoder | None = None
 
-        self._caps_str = AVPair(
-            None,
-            "audio/x-raw,format=S16LE,channels=1,rate=8000,layout=interleaved"
-        )
+        self._caps_str = Pair(None, "audio/x-raw,format=S16LE,channels=1,rate=8000,layout=interleaved")
         self._caps_ready = threading.Event()
 
-        # NOTE 1
-        # 비디오 스트림은 비디오 큐(vqueue)에서 이미지 처리기(image processor) 콜백을 거친
-        # 다음, 이미지 큐(iqueue)와 웹소켓 큐(websocket queue)에 각각 저장된다.
-        # 전자는 인코더의 비디오 앱소스(vappsrc)에 입력될 데이터로, 후자는 웹 기반 콘솔에서
-        # 화면을 표시할 입력 데이터로 사용된다.
-        # 
-        # 오디오 스트림은 웹 기반 콘솔에서 재생되지 않으므로 인코더의 오디오 앱소스(aappsrc)
-        # 입력으로만 사용된다. 아래의 도식은 비디오 및 오디오 스트림의 흐름을 나타낸다.
-        #
-        # (1) ... -> vqueue -> [image_processor] -> iqueue -> vappsrc -> ...
-        # (2) ... -> vqueue -> [image_processor] -> wqueue -> ...
-        # (3) ... -> aqueue --------------------------------> aappsrc -> ...
-        self._image_processor = image_processor
-        self._iqueue: EvictingQueue = None  # image queue
-        self._wqueue: EvictingQueue = None  # websocket queue
+        self._frame_queue: EvictingQueue | None = None
+        self._frame_processor: SingleThreadTask | None = None
 
-        # NOTE 2
-        # 이미지 공급자(image_feeder)는 vqueue에서 비디오 프레임 하나를 가져와 이미지 처리기를
-        # 이용해 처리한 다음 iqueue와 wqueue에 공급하는 작업을 반복하는 스레드이다.
-        # 
-        # 비디오 공급자(video_feeder)는 iqueue에서 이미지 하나를 가져와 vappsrc에 공급하는
-        # 작업을 반복하는 스레드이고, 오디오 공급자는(audio_feeder)는 aqueue에서 오디오 샘플
-        # 하나를 가져와 aappsrc에 공급하는 작업을 반복하는 스레드이다.
-        self._image_feeder: SingleThreadTask = None
-        self._video_feeder: SingleThreadTask = None
-        self._audio_feeder: SingleThreadTask = None
+        self._video_feeder: SingleThreadTask | None = None
+        self._audio_feeder: SingleThreadTask | None = None
 
-        # NOTE 3
-        # 에러 핸들러(error_handler)는 각 공급자가 큐에서 데이터를 가져올 때 예외가 발생할
-        # 경우 이를 제어하기 위한 콜백이다. 덧붙이자면, 발생 가능한 예외는 EvictingQueue의
-        # 함수 get()의 'Timeout' 또는 어떤 이유에 의해 EvictingQueue가 None이 되었을 때
-        # None 타입은 어트리뷰트 get()을 갖지 않는다는 'NoneType'이다. 
-        self._error_handler = error_handler
+        self._ws_queue: EvictingQueue | None = None
+        self._fn_improc = fn_improc
+        self._on_error = on_error
 
     @property
     def websocket_queue(self) -> EvictingQueue | None:
-        return self._wqueue
+        return self._ws_queue
 
-    def _job_image_feeding(self):
+    def _process_frames(self):
         try:
             blob = self._decoder.video_queue.get()
-        except Exception as e:
-            # Timeout or NoneType Error
-            if self._error_handler:
-                self._error_handler(e)
+        except Timeout as e:
+            if self._on_error:
+                self._on_error(e)
             return
         frame_yuv, pts, dts, duration = blob
         frame_bgr = cv2.cvtColor(frame_yuv, cv2.COLOR_YUV2BGR_I420)
@@ -395,33 +386,30 @@ class RTSPStreamer():
             h, w = frame_bgr.shape[:2]
             self._caps_str.video = f"video/x-raw,format=I420,width={w},height={h}"
             self._caps_ready.set()
-
-        # Image processing
+        # <-- TODO: DE-IDENTIFICATION
         try:
-            res = self._image_processor(frame_bgr)
+            res = self._fn_improc(frame_bgr)
         except:
             logger.exception("INFERENCE EEROR:")
             res = draw_circle(frame_bgr)
         frame_bgr = res
-
-        # Feed an image to the websocket queue
+        # -->
+        # <-- TODO: PUT WEBSOCKET QUEUE
         _, jpg_buffer = cv2.imencode(".jpg", frame_bgr)
         jpg_bytes = jpg_buffer.tobytes()
-        self._wqueue.put(jpg_bytes)
-
-        # Feed an image to the image queue
+        self._ws_queue.put(jpg_bytes)
+        # -->
         frame_yuv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YUV_I420)
         frame_bytes = frame_yuv.tobytes()
         blob = (frame_bytes, pts, dts, duration)
-        self._iqueue.put(blob)
+        self._frame_queue.put(blob)
 
-    def _feed_video_to_appsrc(self, appsrc):
+    def _feed_video(self, appsrc):
         try:
-            blob = self._iqueue.get()
-        except Exception as e:
-            # Timeout or NoneType Error
-            if self._error_handler:
-                self._error_handler(e)
+            blob = self._frame_queue.get()
+        except Timeout as e:
+            if self._on_error:
+                self._on_error(e)
             return
         frame_bytes, pts, dts, duration = blob
         buf = Gst.Buffer.new_allocate(None, len(frame_bytes), None)
@@ -431,13 +419,12 @@ class RTSPStreamer():
         buf.duration = duration
         appsrc.emit("push-buffer", buf)
 
-    def _feed_audio_to_appsrc(self, appsrc):
+    def _feed_audio(self, appsrc):
         try:
             blob = self._decoder.audio_queue.get()
-        except Exception as e:
-            # Timeout or NoneType Error
-            if self._error_handler:
-                self._error_handler(e)
+        except Timeout as e:
+            if self._on_error:
+                self._on_error(e)
             return
         audio_bytes, pts, dts, duration = blob
         buf = Gst.Buffer.new_allocate(None, len(audio_bytes), None)
@@ -455,28 +442,30 @@ class RTSPStreamer():
 
         codec = extract_codec(location)
 
-        self._decoder = AVDecoder()
+        self._decoder = VideoAudioDecoder()
         self._decoder.start(location, codec)
 
         if self._decoder.video_queue:
-            self._wqueue = EvictingQueue()
-            self._iqueue = EvictingQueue()
-            self._image_feeder = SingleThreadTask("frame_processor")
-            self._image_feeder.start(self._job_image_feeding)
+            # < -- TODO: WEBSOCKET
+            self._ws_queue = EvictingQueue()
+            # -->
+            self._frame_queue = EvictingQueue()
+            self._frame_processor = SingleThreadTask("frame_processor")
+            self._frame_processor.start(self._process_frames)
         
         self._caps_ready.wait()
 
-        self._encoder = AVEncoder()
+        self._encoder = VideoAudioEncoder()
         self._encoder.start(codec, self._caps_str)
 
         if self._encoder.video_appsrc:
             self._video_feeder = SingleThreadTask("video_feeder")
             self._video_feeder.start(
-                self._feed_video_to_appsrc, [self._encoder.video_appsrc])
+                self._feed_video, [self._encoder.video_appsrc])
         if self._encoder.audio_appsrc:
             self._audio_feeder = SingleThreadTask("audio_feeder")
             self._audio_feeder.start(
-                self._feed_audio_to_appsrc, [self._encoder.audio_appsrc])
+                self._feed_audio, [self._encoder.audio_appsrc])
 
     def stop_streaming(self):
         if self._video_feeder:
@@ -485,14 +474,14 @@ class RTSPStreamer():
         if self._audio_feeder:
             self._audio_feeder.stop()
             self._audio_feeder = None
-        if self._image_feeder:
-            self._image_feeder.stop()
-            self._image_feeder = None
+        if self._frame_processor:
+            self._frame_processor.stop()
+            self._frame_processor = None
 
         if self._loop:
             self._loop.quit()
             if self._loop_th:
-                self._loop_th.join(timeout=5)
+                self._loop_th.join()
             self._loop = None
             self._loop_th = None
 
