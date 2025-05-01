@@ -12,9 +12,16 @@ from fastapi.websockets import WebSocket
 from fastapi.websockets import WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.rtsp import RTSPStreamer, FailedToExtract
+from src.rtsp import RTSPStreamer
 from src.yolo.facedet import Facedetector
 from src.image import map_xyxy, expand_xyxy, pixelate_xyxy
+
+
+# NOTE 주의
+# 이 코드는 클라이언트가 하나 또는 서비스 요청이 매우 적은 특수한 상황을
+# 가정하고 작성되었다. 경합 조건(race condition)을 고려하지 않은
+# 비동기 환경이므로 클라이언트 요청이 많은 환경에서 문제를 일으킬 여지가
+# 있으니 주의해야 한다.
 
 
 FACEDET: Facedetector | None = None
@@ -27,7 +34,7 @@ IS_RESTARTING = False
 RESTART_LOCK = threading.Lock()
 
 
-with open("configs/streaming.json", "r") as f:
+with open("configs/stream.json", "r") as f:
     CFG = json.load(f)
 
 LOCATION = CFG["location"]
@@ -169,19 +176,12 @@ async def start_streaming(data: dict=Body(...)):
     try:
         loc = LOCATION if not location else location
         start_streamer(loc)
-    except FailedToExtract as e:
-        logger.exception(e)
-        stop_streamer()
-        raise HTTPException(
-            status_code=400,
-            detail=f"FastAPI - {str(e)}"
-        )
     except Exception as e:
         logger.exception(e)
         stop_streamer()
         raise HTTPException(
             status_code=500,
-            detail=f"FastAPI - {str(e)}"
+            detail=f"FastAPI: {str(e)}"
         )
     else:
         LOCATION = loc
@@ -195,8 +195,12 @@ async def stop_streaming():
     if STREAMER is not None:
         try:
             STREAMER.stop_streaming()
-        except Exception:
-            logger.exception("Unexpected error occurred while stopping stream.")
+        except Exception as e:
+            logger.exception(e)
+            raise HTTPException(
+                status_code=500,
+                detail=f"FastAPI: {str(e)}"
+            )
         finally:
             STREAMER = None
     return {"status": "success", "message": "streaming stopped." }
