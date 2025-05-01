@@ -11,41 +11,46 @@ from fastapi import FastAPI, HTTPException, Body
 from fastapi.websockets import WebSocket
 from fastapi.websockets import WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.websockets import WebSocketState
 
 from src.rtsp import RTSPStreamer
 from src.yolo.facedet import Facedetector
 from src.image import map_xyxy, expand_xyxy, pixelate_xyxy
 
 
-# NOTE 주의
-# 이 코드는 클라이언트가 하나 또는 서비스 요청이 매우 적은 특수한 상황을
-# 가정하고 작성되었다. 경합 조건(race condition)을 고려하지 않은
-# 비동기 환경이므로 클라이언트 요청이 많은 환경에서 문제를 일으킬 여지가
-# 있으니 주의해야 한다.
+# ============================================================================
+""" NOTE 이 코드는 클라이언트로부터 서비스 요청이 매우 적은 특수한 환경을 가정하고 작성
+되었습니다. 경합 조건(race condition)을 거의 핸들링하지 않으므로 클라이언트 요청이 많은
+환경에서는 문제를 일으킬 여지가 많으니 반드시 코드를 수정하셔야 합니다. """
+
+FACEDET: Facedetector = None    # 얼굴 탐지기
+STREAMER: RTSPStreamer = None   # 스트림 송출기
+
+IS_ROI_UPDATED: bool = False        # 식별 영역 업데이트 플래그
+ROI_MASK: np.ndarray | None = None  # 식별 영역 마스크
+
+IS_RESTARTING = False            # 서버 재시작 플래그
+RESTART_LOCK = threading.Lock()  # 서버 재시작 요청의 경합 조건 제어용 락
 
 
-FACEDET: Facedetector | None = None
-STREAMER: RTSPStreamer | None = None
-
-IS_ROI_UPDATED: bool = False
-ROI_MASK: np.ndarray | None = None
-
-IS_RESTARTING = False
-RESTART_LOCK = threading.Lock()
-
-
+# 저장된 스트림 설정 불러오기
 with open("configs/stream.json", "r") as f:
     CFG = json.load(f)
 
-LOCATION = CFG["location"]
-INFER_SIZE = CFG["infer_size"]
-CONF_THRES = CFG["conf_thres"]
-SCALE_FACTOR = CFG["scale_factor"]
-PIXEL_SIZE = CFG["pixel_size"]
-ROI = CFG["roi"]
+LOCATION = CFG["location"]           # 카메라 RTSP URL
+INFER_SIZE = CFG["infer_size"]       # 추론 시 적용되는 해상도 - 기본: 720p
+CONF_THRES = CFG["conf_thres"]       # 추론 확신도의 임계값 - 기본: 25%
+SCALE_FACTOR = CFG["scale_factor"]   # 비식별화 박스 사이즈 확대율 - 기본: 50%
+PIXEL_SIZE = CFG["pixel_size"]       # 비식별화 픽셀 사이즈 - 기본: 25px
+ROI = CFG["roi"]                     # 비식별화 영역 꼭지점들의 상대 좌표
 
+
+# ============================================================================
+""" NOTE 비식별화 작업과 관련된 함수들 입니다. """
 
 def exclude_xyxy(xyxy: np.ndarray) -> np.ndarray:
+    """ 식별 영역 안의 박스들을 전체 박스 목록에서 제거합니다. 이들은 비식별 대상이
+    아닙니다. """
     if not ROI_MASK is None:
         center = np.zeros((len(xyxy), 2), dtype=int)
         center[:, 0] = ((xyxy[:, 0] + xyxy[:, 2]) / 2).astype(int)
@@ -56,6 +61,8 @@ def exclude_xyxy(xyxy: np.ndarray) -> np.ndarray:
 
 
 def update_mask(frame_shape: tuple[int, int]):
+    """ 식별 영역을 갱신합니다. 식별 영역의 꼭지점들은 상대 좌표 값을 갖기 때문에 이를
+    frame_shape에 대응하는 절대 좌표 값으로 변환해 주어야 합니다. """
     global ROI_MASK
     roi = np.array(ROI)
     if roi.shape[0] >= 3:
@@ -68,6 +75,7 @@ def update_mask(frame_shape: tuple[int, int]):
 
 
 def deidentify_face(frame: np.ndarray):
+    """ 얼굴을 비식별화 합니다. """
     global IS_ROI_UPDATED
 
     frame_shape = frame.shape[:2][::-1]
@@ -75,27 +83,33 @@ def deidentify_face(frame: np.ndarray):
         update_mask(frame_shape)
         IS_ROI_UPDATED = False
 
-    is_720p = frame_shape == INFER_SIZE
-    if not is_720p:
+    is_infer_size = frame_shape == INFER_SIZE
+    if not is_infer_size:
         res = FACEDET.predict(cv2.resize(frame, dsize=INFER_SIZE), conf=CONF_THRES)
     else:
         res = FACEDET.predict(frame, conf=CONF_THRES)
     xyxy = res[:, :4].astype(int)
-    if not is_720p:
+
+    if not is_infer_size:
         xyxy = map_xyxy(INFER_SIZE, frame_shape, xyxy)
     xyxy = expand_xyxy(xyxy, SCALE_FACTOR)
     xyxy = exclude_xyxy(xyxy)
+
     frame = pixelate_xyxy(frame, xyxy, pixel_size=PIXEL_SIZE, clamp=True)
     return frame
 
 
+# ============================================================================
+""" NOTE 스트림 송출기 제어와 관련된 함수들 입니다. """
+
 def start_streamer(location: str):
+    """ 스트림 송출기를 가동합니다. """
     global STREAMER, IS_RESTARTING
 
-    if STREAMER:
+    if STREAMER is not None:
         STREAMER.stop_streaming()
 
-    def _on_error(e: Exception):
+    def _error_handler(e: Exception):
         global IS_RESTARTING
 
         with RESTART_LOCK:
@@ -105,47 +119,38 @@ def start_streamer(location: str):
 
         def _restart():
             global IS_RESTARTING
-            logger.warning("Stream lost. Reconnecting in 5 seconds…")
+            logger.warning("Stream lost. Reconnecting in 5s ...")
             while True:
                 time.sleep(5)
                 try:
                     start_streamer(location)
                     break
-                except Exception as err:
-                    logger.exception(f"Reconnection failed: {err}. Retrying in 5 seconds…")
-
+                except Exception:
+                    logger.warning(f"... failed. Retrying in 5s ...")
             with RESTART_LOCK:
                 IS_RESTARTING = False
 
         threading.Thread(target=_restart, daemon=True).start()
 
-    STREAMER = RTSPStreamer(deidentify_face, on_error=_on_error)
+    STREAMER = RTSPStreamer(deidentify_face, _error_handler)
     STREAMER.start_streaming(location)
 
 
 def stop_streamer():
+    """ 스트림 송출기를 멈추고 제거합니다. """
     global STREAMER
+
     if STREAMER is not None:
         try:
             STREAMER.stop_streaming()
-        except:
-            logger.warning("Unexpected error occurred while stopping stream.")
+        except Exception as e:
+            logger.exception(f"main: stop_streamer: {e}")
         finally:
             STREAMER = None
 
 
-def store_configuration():
-    new_cfg = {
-        "location": LOCATION,
-        "infer_size": INFER_SIZE,
-        "conf_thres": CONF_THRES,
-        "scale_factor" : SCALE_FACTOR,
-        "pixel_size": PIXEL_SIZE,
-        "roi": ROI
-    }
-    with open("configs/streaming.json", "w") as f:
-        json.dump(new_cfg, f, indent=4)
-
+# ============================================================================
+""" NOTE FastAPI 서비스와 관련된 함수들 입니다. """
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -172,20 +177,22 @@ app.add_middleware(
 @app.post("/streaming/start")
 async def start_streaming(data: dict=Body(...)):
     global LOCATION
-    location = data["location"]
+    loc: str = data.get("location", "").strip()
     try:
-        loc = LOCATION if not location else location
+        if not loc and not LOCATION:
+            empty_loc = "Missing RTSP stream location. Please write a valid location field."
+            raise HTTPException(status_code=400, detail=empty_loc)
+        if loc and not loc.startswith("rtsp://"):
+            not_rtsp_loc = f"Invalid stream location: '{loc}'. Must start with 'rtsp://'."
+            raise HTTPException(status_code=400, detail=not_rtsp_loc)
+        if not loc and LOCATION:
+            loc = LOCATION
         start_streamer(loc)
     except Exception as e:
-        logger.exception(e)
+        logger.exception("Failed to start streaming.")
         stop_streamer()
-        raise HTTPException(
-            status_code=500,
-            detail=f"FastAPI: {str(e)}"
-        )
-    else:
-        LOCATION = loc
-        store_configuration()
+        internal_err = f"Internal server error while starting stream: {str(e)}"
+        raise HTTPException(status_code=500, detail=internal_err)
     return { "status": "success", "message": "streaming started." }
 
 
@@ -196,20 +203,32 @@ async def stop_streaming():
         try:
             STREAMER.stop_streaming()
         except Exception as e:
-            logger.exception(e)
-            raise HTTPException(
-                status_code=500,
-                detail=f"FastAPI: {str(e)}"
-            )
+            logger.exception("Failed to stop streaming.")
+            internal_err = f"Internal server error while stopping stream: {str(e)}"
+            raise HTTPException(status_code=500, detail=internal_err)
         finally:
             STREAMER = None
     return {"status": "success", "message": "streaming stopped." }
 
 
-@app.post("/configs/store")
-async def store_configs():
-    store_configuration()
-    return {"status": "success", "message": "configs stored." }
+@app.post("/config/save")
+async def save_config():
+    new_cfg = {
+        "location": LOCATION,
+        "infer_size": INFER_SIZE,
+        "conf_thres": CONF_THRES,
+        "scale_factor" : SCALE_FACTOR,
+        "pixel_size": PIXEL_SIZE,
+        "roi": ROI
+    }
+    try:
+        with open("configs/stream.json", "w") as f:
+            json.dump(new_cfg, f, indent=4)
+    except Exception as e:
+        logger.exception("Failed to store configuration.")
+        internal_err = f"Internal server error while store configuration: {str(e)}"
+        raise HTTPException(status_code=500, detail=internal_err)
+    return {"status": "success", "message": "configuration saved." }
 
 
 @app.get("/get/roi")
@@ -267,7 +286,7 @@ async def update_roi(roi_data: dict=Body(...)):
 #         return {"status": "success", "message": "Pixel size updated."}
 
 
-@app.websocket('/stream1')
+@app.websocket('/live')
 async def websocket_endpoint(ws: WebSocket):
 
     async def _send():
@@ -284,15 +303,24 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         await _send()
     except WebSocketDisconnect:
-        logger.info('Connection has closed.')
+        logger.info("Connection has closed.")
     except asyncio.CancelledError:
-        logger.info('Connection has cancelled.')
+        logger.info("Connection has cancelled.")
+    except AttributeError:
+        pass
     except Exception as e:
-        logger.exception(f'Unexpected error: {str(e)}')
-        await ws.close(code=1011)
+        logger.exception(f"Unexpected error: {str(e)}")
+        if ws.application_state == WebSocketState.CONNECTED:
+            try:
+                await ws.close(code=1011)
+            except RuntimeError:
+                pass
     finally:
-        if not ws.client_state.name == "DISCONNECTED":
-            await ws.close()
+        if ws.application_state == WebSocketState.CONNECTED:
+            try:
+                await ws.close()
+            except RuntimeError:
+                pass
 
 
 if __name__ == '__main__':

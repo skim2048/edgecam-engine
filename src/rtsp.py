@@ -65,9 +65,9 @@ def draw_circle(img: np.ndarray):
     return img
 
 
-def extract_codec(location: str, timeout_sec: int=5) -> AVPair:
+def extract_codec(location: str, timeout: int=5) -> AVPair:
     # e.g. location = rtsp://admin:****@192.***.***.***:554/stream
-    codec = AVPair(None, None)
+    codec = AVPair(audio=None, video=None)
     lock = threading.Lock()
     cond = threading.Condition(lock)
     loop = GLib.MainLoop()
@@ -86,18 +86,18 @@ def extract_codec(location: str, timeout_sec: int=5) -> AVPair:
             start_t = time.time()
             while codec.video is None or codec.audio is None:
                 elapsed = time.time() - start_t
-                remaining = timeout_sec - elapsed
+                remaining = timeout - elapsed
                 if remaining <= 0:
                     logger.warning("Timeout occurred during codec extraction.")
                     break
-                cond.wait(timeout_sec=remaining)
+                cond.wait(timeout=remaining)
         loop.quit()
 
     pipe = Gst.parse_launch(f"rtspsrc name=src location={location} latency=200 ! fakesink")
     src = pipe.get_by_name('src')
     handler_id = src.connect('pad-added', on_pad_added)
 
-    logger.info(f'Attempting to extract codecs within {timeout_sec}s ...')
+    logger.info(f'Attempting to extract codecs within {timeout}s ...')
     pipe.set_state(Gst.State.PLAYING)
 
     wait_th = threading.Thread(target=wait_for_codec_extraction)
@@ -173,7 +173,7 @@ class AVDecoder:
         return Gst.FlowReturn.OK
 
     def _create_pipeline(self, location: str, codec: AVPair):
-        sink = AVPair(None, None)
+        sink = AVPair(audio=None, video=None)
         desc = f"rtspsrc name=rtspsrc location={location} latency=200 ! \n"
         if codec.video and codec.video in VIDEO:
             decode_chain = VIDEO[codec.video]["decode_chain"]
@@ -260,35 +260,79 @@ class AVEncoder():
             self.stop()
 
     def _create_pipeline(self, codec: AVPair, caps_str: AVPair):
-        desc = ""
-        if codec.video and codec.video in VIDEO:
+        desc_lines: list[str] = []
+        # --- 비디오 ---
+        if codec.video in VIDEO:
             encode_chain = VIDEO[codec.video]["encode_chain"]
-            desc += "appsrc name=vsrc is-live=true block=true format=time ! "
-            desc += "queue ! "
-            desc += "videoconvert ! "
-            desc += get_chain(encode_chain)
-            desc += "mux. \n"
-        if codec.audio and codec.audio in AUDIO:
+            # 루트
+            desc_lines.append(
+                "appsrc name=vsrc is-live=true block=true format=time ! "
+                "queue ! "
+                "videoconvert ! "
+                "tee name=vtee"
+            )
+            # 루트 -> 메인 스트림
+            main_chain = " ! ".join(encode_chain)
+            desc_lines.append(
+                "vtee. ! "
+                "queue ! "
+                "videoconvert ! "
+                f"{main_chain} ! "
+                "mux_main."
+            )
+            # 루트 -> 서브 스트림
+            desc_lines.append(
+                "vtee. ! "
+                "queue ! "
+                "videoscale ! "
+                "video/x-raw,width=640,height=360 ! "
+                "videoconvert ! "
+                f"{main_chain} ! "
+                "mux_sub."
+            )
+        # --- 오디오 ---
+        if codec.audio in AUDIO:
             encode_chain = AUDIO[codec.audio]["encode_chain"]
-            desc += "appsrc name=asrc is-live=true block=true format=time ! "
-            desc += "queue ! "
-            desc += "audioconvert ! queue !"
-            desc += get_chain(encode_chain)
-            desc += "mux. \n"
+            # 루트
+            desc_lines.append(
+                "appsrc name=asrc is-live=true block=true format=time ! "
+                "queue ! "
+                "audioconvert ! "
+                "tee name=atee"
+            )
+            audio_chain = " ! ".join(encode_chain)
+            # 루트 -> 메인 스트림
+            desc_lines.append(
+                "atee. ! "
+                "queue ! "
+                "audioconvert ! "
+                f"{audio_chain} ! "
+                "mux_main."
+            )
+            # 루트 -> 서브 스트림
+            desc_lines.append(
+                "atee. ! "
+                "queue ! "
+                "audioconvert ! "
+                f"{audio_chain} ! "
+                "mux_sub."
+            )
 
-        # ===== 1. Fakesink =====
-        # desc += "fakesink \n"
-        # =======================
+        # 최종: 비디오+오디오 메인 스트림 (live/main)
+        desc_lines.append(
+            "flvmux name=mux_main streamable=true latency=1000 ! "
+            "queue ! "
+            "rtmpsink location=rtmp://localhost:1935/live/main"
+        )
 
-        # ===== 2. Filesink =====
-        # desc += "matroskamux name=mux ! "
-        # desc += f"filesink location={datetime.now().strftime('%Y%m%d_%H%M%S')}.mkv \n"
-        # =======================
+        # 최종: 비디오+오디오 서브 스트림 (live/sub)
+        desc_lines.append(
+            "flvmux name=mux_sub  streamable=true latency=1000 ! "
+            "queue ! "
+            "rtmpsink location=rtmp://localhost:1935/live/sub"
+        )
 
-        # ===== 3. RTMPsink =====
-        desc += "flvmux name=mux streamable=true latency=1000 ! queue ! "
-        desc += f"rtmpsink location=rtmp://localhost:1935/stream1 \n"
-        # =======================
+        desc = "\n".join(desc_lines)
 
         self._pipe = Gst.parse_launch(desc)
         self._vappsrc = self._pipe.get_by_name("vsrc")
@@ -338,8 +382,8 @@ class RTSPStreamer():
         self._encoder: AVEncoder = None
 
         self._caps_str = AVPair(
-            None,
-            "audio/x-raw,format=S16LE,channels=1,rate=8000,layout=interleaved"
+            audio="audio/x-raw,format=S16LE,channels=1,rate=8000,layout=interleaved",
+            video=None
         )
         self._caps_ready = threading.Event()
 
@@ -461,7 +505,7 @@ class RTSPStreamer():
         if self._decoder.video_queue:
             self._wqueue = EvictingQueue()
             self._iqueue = EvictingQueue()
-            self._image_feeder = SingleThreadTask("frame_processor")
+            self._image_feeder = SingleThreadTask("image_feeder")
             self._image_feeder.start(self._job_image_feeding)
         
         self._caps_ready.wait()
@@ -492,7 +536,7 @@ class RTSPStreamer():
         if self._loop:
             self._loop.quit()
             if self._loop_th:
-                self._loop_th.join(timeout=5)
+                self._loop_th.join()
             self._loop = None
             self._loop_th = None
 
