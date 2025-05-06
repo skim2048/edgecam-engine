@@ -21,7 +21,12 @@ from src.image import map_xyxy, expand_xyxy, pixelate_xyxy
 # ============================================================================
 """ NOTE 이 코드는 클라이언트로부터 서비스 요청이 매우 적은 특수한 환경을 가정하고 작성
 되었습니다. 경합 조건(race condition)을 거의 핸들링하지 않으므로 클라이언트 요청이 많은
-환경에서는 문제를 일으킬 여지가 많으니 반드시 코드를 수정하셔야 합니다. """
+환경에서는 문제를 일으킬 여지가 많으니 반드시 코드를 수정하셔야 합니다.
+
+아직 확인되지 않은 버그와 최적화되지 않은 라인이 존재할 가능성이 높습니다.
+추후 반드시 충분히 테스트 되어야 합니다. 추가적으로 스트리밍을 Python 대신 Rust로 대체할
+필요성이 있는지 검토 중 입니다.
+"""
 
 FACEDET: Facedetector = None    # 얼굴 탐지기
 STREAMER: RTSPStreamer = None   # 스트림 송출기
@@ -179,20 +184,24 @@ async def start_streaming(data: dict=Body(...)):
     global LOCATION
     loc: str = data.get("location", "").strip()
     try:
-        if not loc and not LOCATION:
-            empty_loc = "Missing RTSP stream location. Please write a valid location field."
-            raise HTTPException(status_code=400, detail=empty_loc)
-        if loc and not loc.startswith("rtsp://"):
-            not_rtsp_loc = f"Invalid stream location: '{loc}'. Must start with 'rtsp://'."
-            raise HTTPException(status_code=400, detail=not_rtsp_loc)
-        if not loc and LOCATION:
-            loc = LOCATION
+        if loc:
+            if not loc.startswith("rtsp://"):
+                invalid_loc = f"Invalid stream location: '{loc}'. Must start with 'rtsp://'."
+                raise HTTPException(status_code=400, detail=invalid_loc)
+        else:
+            if LOCATION:
+                loc = LOCATION
+            else:
+                empty_loc = "Missing RTSP stream location. Please write a valid location field."
+                raise HTTPException(status_code=400, detail=empty_loc)
         start_streamer(loc)
     except Exception as e:
         logger.exception("Failed to start streaming.")
         stop_streamer()
         internal_err = f"Internal server error while starting stream: {str(e)}"
         raise HTTPException(status_code=500, detail=internal_err)
+    else:
+        LOCATION = loc
     return { "status": "success", "message": "streaming started." }
 
 
