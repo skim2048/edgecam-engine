@@ -13,20 +13,16 @@ from fastapi.websockets import WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
 
-from src.rtsp import RTSPStreamer
-from src.yolo.facedet import Facedetector
-from src.image import map_xyxy, expand_xyxy, pixelate_xyxy
+from src.streaming.rtsp import RTSPStreamer
+# from src.image import map_xyxy, expand_xyxy, pixelate_xyxy
+from src.de_id.facedet import Facedetector
+from src.de_id.utils import map_boxes_to_image, scale_boxes, clip_boxes_to_image, pixelate_box_regions
+from src.utils.metrics import VideoMetrics
 
-
-# ============================================================================
-""" NOTE 이 코드는 클라이언트로부터 서비스 요청이 매우 적은 특수한 환경을 가정하고 작성
-되었습니다. 경합 조건(race condition)을 거의 핸들링하지 않으므로 클라이언트 요청이 많은
-환경에서는 문제를 일으킬 여지가 많으니 반드시 코드를 수정하셔야 합니다.
-
-아직 확인되지 않은 버그와 최적화되지 않은 라인이 존재할 가능성이 높습니다.
-추후 반드시 충분히 테스트 되어야 합니다. 추가적으로 스트리밍을 Python 대신 Rust로 대체할
-필요성이 있는지 검토 중 입니다.
-"""
+# ==================================
+CASE = 'new'
+VIDEO_METRICS = VideoMetrics()
+# ==================================
 
 FACEDET: Facedetector = None    # 얼굴 탐지기
 STREAMER: RTSPStreamer = None   # 스트림 송출기
@@ -82,6 +78,7 @@ def update_mask(frame_shape: tuple[int, int]):
 def deidentify_face(frame: np.ndarray):
     """ 얼굴을 비식별화 합니다. """
     global IS_ROI_UPDATED
+    global CASE
 
     frame_shape = frame.shape[:2][::-1]
     if IS_ROI_UPDATED:
@@ -93,14 +90,36 @@ def deidentify_face(frame: np.ndarray):
         res = FACEDET.predict(cv2.resize(frame, dsize=INFER_SIZE), conf=CONF_THRES)
     else:
         res = FACEDET.predict(frame, conf=CONF_THRES)
-    xyxy = res[:, :4].astype(int)
 
-    if not is_infer_size:
-        xyxy = map_xyxy(INFER_SIZE, frame_shape, xyxy)
-    xyxy = expand_xyxy(xyxy, SCALE_FACTOR)
-    xyxy = exclude_xyxy(xyxy)
+    # --- TODO START ---
+    # ultralytics.Results 구조 관찰
+    res = res[0]
+    res = res.boxes.data.cpu().numpy()
+    # --- TODO END ---
 
-    frame = pixelate_xyxy(frame, xyxy, pixel_size=PIXEL_SIZE, clamp=True)
+    if CASE == 'legacy':
+        pass
+        # CASE 1: legacy
+        # xyxy = res[:, :4].astype(int)
+        # if not is_infer_size:
+        #     xyxy = map_xyxy(INFER_SIZE, frame_shape, xyxy)
+        # xyxy = xyxy.astype(int)
+        # xyxy = expand_xyxy(xyxy, SCALE_FACTOR)
+        # xyxy = exclude_xyxy(xyxy)
+        # frame = pixelate_xyxy(frame, xyxy, PIXEL_SIZE, clamp=True)
+    elif CASE == 'new':
+        # CASE 2: new
+        boxes = res[:, :4]
+        if not is_infer_size:
+            map_boxes_to_image(INFER_SIZE, frame_shape, boxes)
+        scale_boxes(boxes, 1.5)
+        clip_boxes_to_image(frame_shape, boxes)
+        boxes = exclude_xyxy(boxes)
+        pixelate_box_regions(frame, boxes, PIXEL_SIZE)
+
+    VIDEO_METRICS.update()
+    VIDEO_METRICS.draw_metrics(frame)
+
     return frame
 
 
