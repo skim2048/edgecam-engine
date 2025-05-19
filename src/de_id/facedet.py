@@ -1,3 +1,4 @@
+import gc
 import os
 import shutil
 from pathlib import Path
@@ -5,7 +6,9 @@ from pathlib import Path
 import numpy as np
 from loguru import logger
 
-from src.yolo.common import YOLOWrapper
+import torch
+from ultralytics import YOLO
+from ultralytics.engine.results import Results
 
 
 PROJECT_ROOT = Path(__file__).parents[2]
@@ -33,6 +36,27 @@ def download_model():
         logger.info(f"Model file renamed and cache removed.")
 
 
+class YOLOWrapper:
+
+    def __init__(self, model_pt: str):
+        self._model = YOLO(model_pt)
+
+    def predict(self, image: np.ndarray, conf: float=0.25, tracking: bool=False) -> Results:
+        if tracking:
+            results = self._model.track(image, conf=conf, persist=True, verbose=False)
+        else:
+            results = self._model.predict(image, conf=conf, verbose=False)
+        return results
+
+    def release(self):
+        if next(self._model.parameters()).device.type == "cuda":
+            self._model.to("cpu")
+            torch.cuda.empty_cache()
+        del self._model
+        gc.collect()
+        self._model = None
+
+
 class Facedetector(YOLOWrapper):
 
     def __init__(self):
@@ -49,5 +73,6 @@ class Facedetector(YOLOWrapper):
           : x1, y1, x2, y2, confidence, and label.
         """
         results = super().predict(image, conf=conf, tracking=tracking)
-        boxes = results[0].boxes.data.cpu().numpy()
-        return boxes
+        return results
+        # boxes = results[0].boxes.data.cpu().numpy()
+        # return boxes
