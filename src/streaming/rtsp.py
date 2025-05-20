@@ -11,8 +11,8 @@ from gi.repository import Gst, GLib
 from loguru import logger
 import numpy as np
 
-from src.utils.buffer import EvictingQueue
-from src.utils.task import SingleThreadTask
+from src.core.buffer import EvictingQueue
+from src.core.task import SingleThreadTask
 
 
 Gst.init(None)
