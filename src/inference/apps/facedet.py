@@ -6,10 +6,10 @@ import numpy as np
 from loguru import logger
 from ultralytics.engine.results import Results
 
-from src.vision.yolo.wrapper import YOLOWrapper
+from src.inference.base.yolo import YOLOWrapper
 
 
-PROJECT_ROOT = Path(__file__).parents[2]
+PROJECT_ROOT = Path(__file__).parents[3]
 MODEL_DIR = PROJECT_ROOT/"models"
 MODEL_FILE = MODEL_DIR/"facedet.pt"
 
