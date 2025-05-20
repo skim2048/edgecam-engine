@@ -7,17 +7,26 @@ from contextlib import asynccontextmanager
 import cv2
 import numpy as np
 from loguru import logger
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Body,
+)
 from fastapi.websockets import WebSocket
 from fastapi.websockets import WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
 
 from src.streaming.rtsp import RTSPStreamer
-# from src.image import map_xyxy, expand_xyxy, pixelate_xyxy
-from src.de_id.facedet import Facedetector
-from src.de_id.utils import map_boxes_to_image, scale_boxes, clip_boxes_to_image, pixelate_box_regions
-from src.utils.metrics import VideoMetrics
+from src.utils.metric import VideoMetrics
+from src.inference.apps.facedet import Facedetector
+from src.inference.common.bbox import (
+    map_bboxes_to_target_image,
+    scale_bboxes,
+    clip_bboxes_to_image,
+    pixelate_bbox_regions,
+)
+
 
 # ==================================
 CASE = 'new'
@@ -60,7 +69,7 @@ def exclude_xyxy(xyxy: np.ndarray) -> np.ndarray:
         xyxy = xyxy[~inside_mask]
     return xyxy
 
-
+# -----------------------------------------------------------------------------
 def update_mask(frame_shape: tuple[int, int]):
     """ 식별 영역을 갱신합니다. 식별 영역의 꼭지점들은 상대 좌표 값을 갖기 때문에 이를
     frame_shape에 대응하는 절대 좌표 값으로 변환해 주어야 합니다. """
@@ -73,6 +82,18 @@ def update_mask(frame_shape: tuple[int, int]):
         ROI_MASK = cv2.fillPoly(mask, [roi_pts.reshape(-1, 1, 2)], 255)
     else:
         ROI_MASK = None
+
+# from src.inference.common.point import to_absolute
+# from src.inference.common.mask import create_polygon_mask_image
+# def update_mask(frame_shape: tuple[int, int]):
+#     global ROI_MASK
+#     points = np.array(ROI)
+#     if len(points) >= 3:
+#         to_absolute(frame_shape, points)
+#         ROI_MASK = create_polygon_mask_image(frame_shape, points)
+#     else:
+#         ROI_MASK = None
+# -----------------------------------------------------------------------------
 
 
 def deidentify_face(frame: np.ndarray):
@@ -111,11 +132,11 @@ def deidentify_face(frame: np.ndarray):
         # CASE 2: new
         boxes = res[:, :4]
         if not is_infer_size:
-            map_boxes_to_image(INFER_SIZE, frame_shape, boxes)
-        scale_boxes(boxes, 1.5)
-        clip_boxes_to_image(frame_shape, boxes)
+            map_bboxes_to_target_image(INFER_SIZE, frame_shape, boxes)
+        scale_bboxes(boxes, 1.5)
+        clip_bboxes_to_image(frame_shape, boxes)
         boxes = exclude_xyxy(boxes)
-        pixelate_box_regions(frame, boxes, PIXEL_SIZE)
+        pixelate_bbox_regions(frame, boxes, PIXEL_SIZE)
 
     VIDEO_METRICS.update()
     VIDEO_METRICS.draw_metrics(frame)
